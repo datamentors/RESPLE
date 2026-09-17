@@ -75,6 +75,19 @@ install(TARGETS RESPLE
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
-ament_export_dependencies(rclcpp yaml-cpp message_runtime livox_ros_driver livox_ros_driver2 livox_interfaces)
-ament_export_libraries(${PROJECT_NAME})
+# Exported so glim_ext_resple_bridge can reuse SplineState.h (and its
+# utils/common_utils.h, utils/math_tools.h deps) instead of duplicating the
+# spline math.
+install(DIRECTORY include/
+  DESTINATION include)
+ament_export_include_directories(include)
+# message_runtime is a ROS1/catkin concept with no ROS2 equivalent -- harmless
+# for resple's own build, but any package that find_package(resple)'s (e.g.
+# glim_ext_resple_bridge) fails resolving it via
+# ament_auto_find_build_dependencies(). Dropped rather than left broken.
+ament_export_dependencies(rclcpp yaml-cpp livox_ros_driver livox_ros_driver2 livox_interfaces)
+# ament_export_libraries(${PROJECT_NAME}) removed: it exports a library named
+# "resple" that this CMakeLists builds but never install(TARGETS)'s, so any
+# consumer's find_package(resple) fails looking for it. Not needed anyway --
+# SplineState.h (what glim_ext_resple_bridge actually uses) is header-only.
 ament_package()

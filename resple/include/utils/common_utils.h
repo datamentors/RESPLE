@@ -7,6 +7,11 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <omp.h>
+// Needed for PCL_ADD_POINT4D / EIGEN_ALIGN16 / POINT_CLOUD_REGISTER_POINT_STRUCT
+// below (custom ouster_ros/hesai_ros/... point types). Previously relied on
+// whichever .cpp included this header having already included
+// pcl_conversions/pcl_conversions.h first -- not self-contained without it.
+#include <pcl/point_types.h>
 
 #include "utils/eigen_utils.hpp"
 
