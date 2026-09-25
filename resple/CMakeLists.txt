@@ -7,6 +7,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS} -std=c++17 -O3 -marc
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(bondcpp REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -40,8 +42,10 @@ include_directories(
 	${PCL_INCLUDE_DIRS})
 add_executable(Mapping src/Mapping.cpp)
 add_executable(RESPLE src/RESPLE.cpp include/ikd-Tree/ikd_Tree.cpp)
-	ament_target_dependencies(${PROJECT_NAME} 
+	ament_target_dependencies(${PROJECT_NAME}
 	rclcpp
+	rclcpp_lifecycle
+	bondcpp
 	std_msgs
 	geometry_msgs
 	nav_msgs
@@ -85,7 +89,7 @@ ament_export_include_directories(include)
 # for resple's own build, but any package that find_package(resple)'s (e.g.
 # glim_ext_resple_bridge) fails resolving it via
 # ament_auto_find_build_dependencies(). Dropped rather than left broken.
-ament_export_dependencies(rclcpp yaml-cpp livox_ros_driver livox_ros_driver2 livox_interfaces)
+ament_export_dependencies(rclcpp rclcpp_lifecycle yaml-cpp livox_ros_driver livox_ros_driver2 livox_interfaces)
 # ament_export_libraries(${PROJECT_NAME}) removed: it exports a library named
 # "resple" that this CMakeLists builds but never install(TARGETS)'s, so any
 # consumer's find_package(resple) fails looking for it. Not needed anyway --

@@ -14,6 +14,8 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <build_depend>builtin_interfaces</build_depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>bondcpp</depend>
   <depend>yaml-cpp</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
