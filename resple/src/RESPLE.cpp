@@ -16,7 +16,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <atomic>
+#include <chrono>
 #include <queue>
+#include <unistd.h>
 #include <thread>
 #include <mutex>
 #include <boost/make_shared.hpp>
@@ -63,7 +65,13 @@ public:
             sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(imu_type, 2000000, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1));
         }
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", 50);
-        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", 50);
+        // transient_local so a late-joining subscriber (e.g. a freshly
+        // respawned glim_ros checking "how long has resple actually been
+        // running" before it starts consuming its stream) still gets this
+        // one-shot value, even though it was published long before that
+        // subscriber existed.
+        pub_start_time = this->create_publisher<std_msgs::msg::Int64>(
+            "start_time", rclcpp::QoS(1).transient_local());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", 2);
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
@@ -112,19 +120,29 @@ public:
         // lifecycle state) may still be reading/rewriting that same tree. A
         // second Build() in the same process is a real use-after-free risk, not
         // just a "stale map" inconvenience -- so refuse to activate again in a
-        // process that has already built the tree once, and report failure up
-        // through the ChangeState response so whatever drives recovery
-        // (currently: a human; eventually: ardia_lifecycle_manager) knows this
-        // node needs a full process respawn, not another in-place reconfigure.
+        // process that has already built the tree once. Returning FAILURE alone
+        // would leave this node stuck inactive indefinitely (respawn:true only
+        // triggers on the OS process actually exiting, not on a failed
+        // transition) -- exit the process instead, so pulse.yaml's
+        // respawn/respawn_delay gives a genuinely fresh one within seconds,
+        // matching how every other unrecoverable failure in this stack is
+        // already handled (crash -> respawn), rather than a new silent-stall
+        // failure mode.
         if (ikdtree.Root_Node != nullptr) {
             RCLCPP_ERROR(
                 this->get_logger(),
                 "Refusing to activate: this process already built the ikd-Tree "
                 "local map once. Rebuilding it in place is unsafe (ikd-Tree's "
                 "background rebuild thread may still be touching the old tree "
-                "when Build() frees it). This node needs a full process "
-                "restart, not another activate -- failing this transition.");
-            return CallbackReturn::FAILURE;
+                "when Build() frees it). Exiting this process so respawn:true "
+                "gives a fresh one instead of leaving this node stuck inactive.");
+            rclcpp::shutdown();
+            // rclcpp::shutdown() alone does not terminate the process -- main()'s
+            // normal unwind would still run destructors while a still-running
+            // background thread could be touching now-torn-down objects. Force
+            // an immediate, real exit instead, same fix as glim_ros's identical
+            // guard.
+            _exit(1);
         }
 
         pub_est->on_activate();
@@ -146,6 +164,7 @@ public:
         pc_world.clear();
         accum_nearest_points.clear();
 
+        processing_thread_finished_ = false;
         running_ = true;
         processing_thread_ = std::make_shared<std::thread>(&RESPLE::processData, this);
 
@@ -153,13 +172,54 @@ public:
         return CallbackReturn::SUCCESS;
     }
 
+    // processData() can hang indefinitely under a still-unresolved, pre-existing
+    // condition (seen with the robot stationary for a long time). Before the
+    // lifecycle conversion that hang was invisible at the RPC level -- nothing
+    // else was waiting on this thread. Now on_deactivate()/on_shutdown() call
+    // processing_thread_->join(), which runs on the SAME executor thread that
+    // services lifecycle service calls -- an unbounded join() there means a
+    // stuck processData() takes the whole node's lifecycle RPCs down with it
+    // (matches what was observed: even plain `ros2 lifecycle get` stopped
+    // responding). Poll processing_thread_finished_ (set by processData()
+    // right before it returns) with a bounded timeout instead of blocking on
+    // join() directly; join() itself is still safe to call afterwards since it
+    // returns immediately once the thread has actually finished.
+    bool join_processing_thread_with_timeout(int timeout_ms)
+    {
+        if (!processing_thread_) {
+            return true;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!processing_thread_finished_.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        processing_thread_->join();
+        processing_thread_.reset();
+        return true;
+    }
+
     CallbackReturn on_deactivate(const rclcpp_lifecycle::State &) override
     {
         stop_bond();
         running_ = false;
-        if (processing_thread_) {
-            processing_thread_->join();
-            processing_thread_.reset();
+        if (!join_processing_thread_with_timeout(5000)) {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "processData() did not stop within 5s of deactivate -- it is "
+                "stuck (known pre-existing hang, not resolved here). Exiting "
+                "this process so respawn:true gives a fresh one instead of "
+                "leaving the whole node unresponsive to lifecycle calls.");
+            rclcpp::shutdown();
+            // Confirmed live: without a hard exit here, the still-stuck
+            // processData() thread outlives rclcpp::shutdown() and the process
+            // later segfaults instead of exiting cleanly (rather than just
+            // hanging, which is what this guard was originally written to
+            // avoid) -- so respawn:true never got a chance to kick in reliably
+            // either way. Force the real exit directly.
+            _exit(1);
         }
 
         pub_est->on_deactivate();
@@ -189,12 +249,15 @@ public:
     CallbackReturn on_shutdown(const rclcpp_lifecycle::State &) override
     {
         stop_bond();
-        if (running_) {
-            running_ = false;
-        }
-        if (processing_thread_) {
-            processing_thread_->join();
-            processing_thread_.reset();
+        running_ = false;
+        if (!join_processing_thread_with_timeout(5000)) {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "processData() did not stop within 5s of shutdown -- it is "
+                "stuck (known pre-existing hang, not resolved here). Forcing "
+                "process exit so respawn:true can recover.");
+            rclcpp::shutdown();
+            _exit(1);
         }
         return CallbackReturn::SUCCESS;
     }
@@ -291,9 +354,10 @@ public:
                     accum_nearest_points.clear();
                     t_last_map_upd = max_time_ns;
                 }
-            }                      
+            }
         }
-    }    
+        processing_thread_finished_ = true;
+    }
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -314,6 +378,7 @@ private:
     const std::string odom_id = "world";
 
     std::atomic_bool running_{false};
+    std::atomic_bool processing_thread_finished_{false};
     std::shared_ptr<std::thread> processing_thread_;
 
     std::string bond_topic_name_;
@@ -1042,5 +1107,10 @@ int main(int argc, char *argv[])
     auto resple = std::make_shared<RESPLE>(options);
     RCLCPP_INFO_STREAM(resple->get_logger(), "RESPLE starts!");
     rclcpp::spin(resple->get_node_base_interface());
-    rclcpp::shutdown();
+    // spin() also returns when on_activate()'s guard already called
+    // rclcpp::shutdown() itself (forcing a process exit) -- calling it again
+    // on an already-shutdown context throws, so only call it if still needed.
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
 }
