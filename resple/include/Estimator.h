@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdio>
+#include <cmath>
+
 #include "SplineState.h"
 #include "Association.h"
 
@@ -101,6 +104,14 @@ class Estimator
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas);
+                // DIAGNOSTIC (temporary): a collapse in valid correspondences
+                // (sparse/degenerate geometry, bad ikd-Tree match) would
+                // under-constrain the update below -- flag it so we can see
+                // whether it coincides with the large orientation corrections.
+                if (num_tot_eff < 20) {
+                    fprintf(stderr, "[findCorresp DIAG] low correspondence count: num_tot_eff=%d (pt_meas.size=%zu)\n",
+                      num_tot_eff, pt_meas.size());
+                }
             }
             if (num_tot_eff > 0 && imu_meas.empty()) {
                 updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh);
@@ -120,6 +131,12 @@ class Estimator
                 converged = true;
             }
             if ((t > n_iter) || (i == max_iter - 1)) {
+                // DIAGNOSTIC (temporary): note when the IEKF hits the
+                // iteration cap without converging (i == max_iter - 1 and
+                // t == 0), vs a clean early convergence.
+                if (i == max_iter - 1 && t == 0) {
+                    fprintf(stderr, "[IEKF DIAG] hit max_iter (%d) without converging\n", max_iter);
+                }
                 cov_rcp = ( Eigen::MatrixXd::Identity(XSIZE, XSIZE) - KH) * cov_prop;
                 cov_rcp = 0.5*(cov_rcp + cov_rcp.transpose());
                 break;
@@ -132,15 +149,32 @@ class Estimator
         if (spl.maxTimeNs() >= t) {
             cov_rcp += cov_sys;
         } else {
+            // DIAGNOSTIC (temporary): count how many knots get extrapolated in
+            // this one call, and the magnitude of the orientation delta being
+            // reused across all of them -- investigating whether a large
+            // catch-up gap here, repeating a non-negligible delta many times,
+            // is what produces runaway orientation divergence after a stall.
+            int diag_iters = 0;
+            double diag_delta_norm = 0.0;
+            int64_t diag_t0 = spl.maxTimeNs();
             while (spl.maxTimeNs() < t) {
                 Eigen::Matrix<double, 24, 1> cps_win = spl.getRCPs();
                 Eigen::Matrix<double, 6, 1> cp_prop_pos = 2*cps_win.block<6, 1>(12, 0) - cps_win.block<6, 1>(0, 0);
                 Eigen::Vector3d delta = cps_win.segment<3>(9);
                 spl.addOneStateKnot(cp_prop_pos.head<3>(), delta);
                 cov_rcp = a_mat * cov_rcp * a_mat.transpose() + cov_sys;
+                diag_iters++;
+                diag_delta_norm = delta.norm();
+            }
+            if (diag_iters > 0) {
+                fprintf(stderr,
+                  "[propRCP DIAG] extrapolated %d knots in one call (gap=%.1fms, "
+                  "reused |delta|=%.6f rad/knot, total~%.3f deg) t0=%ld t=%ld\n",
+                  diag_iters, (t - diag_t0) / 1e6, diag_delta_norm,
+                  diag_iters * diag_delta_norm * 180.0 / M_PI, diag_t0, t);
             }
         }
-    }    
+    }
 
     SplineState* getSpline() {
         return &spl;
@@ -221,9 +255,22 @@ class Estimator
         spl.updateRCPs(cp_win);
         if constexpr (XSIZE == 30) {
             ba = xupd.segment(BA_OFFSET, 3);
-            bg = xupd.segment(BG_OFFSET, 3);   
+            bg = xupd.segment(BG_OFFSET, 3);
+            // DIAGNOSTIC (temporary): track the gyro/accel bias estimate over
+            // time, tagged with the current knot count so it's correlatable
+            // against the /est_window-index-based analysis already done --
+            // investigating whether bg itself diverges during the window
+            // that showed a sustained, non-canceling Z-axis orientation bias
+            // (idx ~9400-11100), rather than any single update or a bad
+            // correspondence set.
+            static int diag_call_count = 0;
+            diag_call_count++;
+            if (diag_call_count % 20 == 0) {
+                fprintf(stderr, "[bias DIAG] numKnots=%lld bg=(%.6f,%.6f,%.6f) |bg|=%.6f ba=(%.6f,%.6f,%.6f) |ba|=%.6f\n",
+                  (long long) spl.numKnots(), bg.x(), bg.y(), bg.z(), bg.norm(), ba.x(), ba.y(), ba.z(), ba.norm());
+            }
         }
-    }        
+    }
 
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh)
@@ -333,12 +380,13 @@ class Estimator
     }
 
     template <int RSIZE>
-    void update(const Eigen::Matrix<double, RSIZE, 1>& innov, const Eigen::Matrix<double, RSIZE, 1>& R_inv, const Eigen::Matrix<double, RSIZE, XSIZE>& H, 
+    void update(const Eigen::Matrix<double, RSIZE, 1>& innov, const Eigen::Matrix<double, RSIZE, 1>& R_inv, const Eigen::Matrix<double, RSIZE, XSIZE>& H,
         const Eigen::Matrix<double, XSIZE, 1>& x_prop, const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
     {
         int num_pts = innov.rows();
         Eigen::Matrix<double, XSIZE, 1> RCPs_post;
-        Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE); 
+        Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE);
+        Eigen::Matrix<double, XSIZE, 1> deltax;  // DIAGNOSTIC: hoisted out of the branches so we can log it below
         if (num_pts > XSIZE) {
             Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = cov_prop.llt().solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> HT_R_inv;
@@ -352,10 +400,10 @@ class Estimator
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = S_inv * HT_R_inv;
 
-            KH.noalias() = S_inv * HT_R_inv_H;     
+            KH.noalias() = S_inv * HT_R_inv_H;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;      
-            RCPs_post.noalias() = getState() + deltax;      
+            deltax = KH * delta_cur + K * innov - delta_cur;
+            RCPs_post.noalias() = getState() + deltax;
         } else {
             Eigen::Matrix<double, RSIZE, RSIZE> R = R_inv.cwiseInverse().asDiagonal();
             Eigen::Matrix<double, RSIZE, RSIZE> S;
@@ -364,9 +412,24 @@ class Estimator
             K.noalias() = cov_prop * H.transpose() * S.inverse();
             KH.noalias() = K * H;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
+            deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
         }
-        updateState(RCPs_post);     
-    }    
+        // DIAGNOSTIC (temporary): log the correction magnitude applied to the
+        // LAST knot's orientation (offset 21..23 of the 24-dim CP block --
+        // knots are [pos(3),ort_del(3)] x4, so knot 3's ort_del starts at
+        // 18+3=21) -- investigating whether a single IEKF update call injects
+        // an anomalously large orientation correction, now that propRCP's
+        // catch-up extrapolation and the raw sensor data have both been ruled
+        // out as the source of the divergence.
+        const double ort_corr_norm = deltax.template segment<3>(21).norm();
+        if (ort_corr_norm > 0.02) {  // ~1.1 deg in one single update call
+            fprintf(stderr,
+              "[update DIAG] LARGE orientation correction: |delta_ort|=%.4f rad (%.2f deg) "
+              "num_pts=%d branch=%s innov_norm=%.4f\n",
+              ort_corr_norm, ort_corr_norm * 180.0 / M_PI, num_pts,
+              (num_pts > XSIZE ? "normal" : "small-system"), innov.norm());
+        }
+        updateState(RCPs_post);
+    }
 };

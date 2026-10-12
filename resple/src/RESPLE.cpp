@@ -479,8 +479,10 @@ private:
     double cov_RCP_ort_old = 0.02;
     double cov_RCP_pos_new = 0.1;    
     double cov_RCP_ort_new = 0.1;    
-    double cov_sys_pos = 0.1;    
-    double cov_sys_ort = 0.01;    
+    double cov_sys_pos = 0.1;
+    double cov_sys_ort = 0.01;
+    double cov_sys_ba = 0.1;
+    double cov_sys_bg = 0.01;
     Parameters param;
     int64_t dt_ns;
     int num_points_upd;
@@ -519,6 +521,10 @@ private:
         double std_ort = CommonUtils::readParam<double>(*this, "std_sys_ort");
         cov_sys_pos = std_pos*std_pos*dt_s*dt_s;
         cov_sys_ort = std_ort*std_ort*dt_s*dt_s;
+        double std_ba = CommonUtils::readParam<double>(*this, "std_sys_ba", std_pos);
+        double std_bg = CommonUtils::readParam<double>(*this, "std_sys_bg", std_ort);
+        cov_sys_ba = std_ba*std_ba*dt_s*dt_s;
+        cov_sys_bg = std_bg*std_bg*dt_s*dt_s;
         param.coeff_cov = CommonUtils::readParam<double>(*this, "coeff_cov", 10);
 
         cube_len = CommonUtils::readParam<double>(*this, "cube_len");
@@ -544,8 +550,8 @@ private:
         Q_block_old.topLeftCorner<3, 3>() = cov_RCP_pos_old*cov_sys_pos *Eigen::Matrix3d::Identity();
         Q_block_old.bottomRightCorner<3, 3>() = cov_RCP_ort_old*cov_sys_ort *Eigen::Matrix3d::Identity();
         Eigen::Matrix<double, 6, 6> Q_block_new = Eigen::Matrix<double, 6, 6>::Zero();
-        Q_block_new.topLeftCorner<3, 3>() = cov_RCP_pos_new*cov_sys_pos *Eigen::Matrix3d::Identity();
-        Q_block_new.bottomRightCorner<3, 3>() = cov_RCP_ort_new*cov_sys_ort *Eigen::Matrix3d::Identity();        
+        Q_block_new.topLeftCorner<3, 3>() = cov_RCP_pos_new*cov_sys_ba *Eigen::Matrix3d::Identity();
+        Q_block_new.bottomRightCorner<3, 3>() = cov_RCP_ort_new*cov_sys_bg *Eigen::Matrix3d::Identity();
         Q.topLeftCorner<6, 6>() = Q_block_old;
         Q.block<6, 6>(6, 6) = Q_block_old;
         Q.block<6, 6>(12, 12) = Q_block_old;
@@ -860,9 +866,9 @@ private:
         int64_t start_t_ns = std::numeric_limits<int64_t>::max();
         for (const auto& [lidar_name, lidar_data] : lidars_data) {
             start_t_ns = std::min(start_t_ns, std::max(lidar_data.pt_buff.front().time_ns, int64_t(0)));
-        }        
+        }
         if (!if_init_filter) {
-            Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();   
+            Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();
             if (!if_lidar_only) {
                 Eigen::Vector3d gravity_sum(0, 0, 0);
                 m_buff.lock();
@@ -873,7 +879,7 @@ private:
                 }
                 while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
                     imu_buff.pop_front();
-                }                    
+                }
                 m_buff.unlock();
                 gravity_sum /= n_imu;
                 Eigen::Vector3d gravity_ave = gravity_sum.normalized() * 9.81;
